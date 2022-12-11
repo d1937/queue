@@ -1,226 +1,166 @@
 package queue
 
 import (
-	"math/rand"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-const minQueueLen = 32
-
+//MyQueue queue
 type Queue struct {
-	items             map[int64]interface{}
-	ids               map[interface{}]int64
-	buf               []int64
-	head, tail, count int
-	mutex             *sync.Mutex
-	notEmpty          *sync.Cond
-	// You can subscribe to this channel to know whether queue is not empty
-	NotEmpty chan struct{}
+	sync.Mutex
+	popable *sync.Cond
+	buffer  *queue.Queue
+	closed  bool
+	count   int32
+	cc      chan interface{}
+	once    sync.Once
 }
 
+//New 创建
 func New() *Queue {
-	q := &Queue{
-		items:    make(map[int64]interface{}),
-		ids:      make(map[interface{}]int64),
-		buf:      make([]int64, minQueueLen),
-		mutex:    &sync.Mutex{},
-		NotEmpty: make(chan struct{}, 1),
+	ch := &Queue{
+		buffer: queue.New(),
+	}
+	ch.popable = sync.NewCond(&ch.Mutex)
+	return ch
+}
+
+//Pop 取出队列,（阻塞模式）
+func (q *Queue) Pop() (v interface{}) {
+	c := q.popable
+
+	q.Mutex.Lock()
+	defer q.Mutex.Unlock()
+
+	for q.Len() == 0 && !q.closed {
+		c.Wait()
 	}
 
-	q.notEmpty = sync.NewCond(q.mutex)
-
-	return q
-}
-
-// Removes all elements from queue
-func (q *Queue) Clean() {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	q.items = make(map[int64]interface{})
-	q.ids = make(map[interface{}]int64)
-	q.buf = make([]int64, minQueueLen)
-	q.tail = 0
-	q.head = 0
-	q.count = 0
-}
-
-// Returns the number of elements in queue
-func (q *Queue) Qsize() int {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	return len(q.items)
-}
-
-// resizes the queue to fit exactly twice its current contents
-// this can result in shrinking if the queue is less than half-full
-func (q *Queue) resize() {
-	newCount := q.count << 1
-
-	if q.count < 2<<18 {
-		newCount = newCount << 2
+	if q.closed { //已关闭
+		return
 	}
 
-	newBuf := make([]int64, newCount)
+	if q.Len() > 0 {
+		buffer := q.buffer
+		v = buffer.Peek()
+		buffer.Remove()
+		atomic.AddInt32(&q.count, -1)
+	}
+	return
+}
 
-	if q.tail > q.head {
-		copy(newBuf, q.buf[q.head:q.tail])
+// TryPop 试着取出队列（非阻塞模式）返回ok == false 表示空
+func (q *Queue) TryPop() (v interface{}, ok bool) {
+	buffer := q.buffer
+
+	q.Mutex.Lock()
+	defer q.Mutex.Unlock()
+
+	if q.Len() > 0 {
+		v = buffer.Peek()
+		buffer.Remove()
+		atomic.AddInt32(&q.count, -1)
+		ok = true
+	} else if q.closed {
+		ok = true
+	}
+
+	return
+}
+
+// TryPopTimeout 试着取出队列（塞模式+timeout）返回ok == false 表示超时
+func (q *Queue) TryPopTimeout(tm time.Duration) (v interface{}, ok bool) {
+	q.once.Do(func() {
+		q.cc = make(chan interface{}, 1)
+	})
+	go func() {
+		q.popChan(&q.cc)
+	}()
+
+	ok = true
+	timeout := time.After(tm)
+	select {
+	case v = <-q.cc:
+	case <-timeout:
+		if !q.closed {
+			q.popable.Signal()
+		}
+		ok = false
+	}
+
+	return
+}
+
+//Pop 取出队列,（阻塞模式）
+func (q *Queue) popChan(v *chan interface{}) {
+	c := q.popable
+
+	q.Mutex.Lock()
+	defer q.Mutex.Unlock()
+
+	for q.Len() == 0 && !q.closed {
+		c.Wait()
+	}
+
+	if q.closed { //已关闭
+		*v <- nil
+		return
+	}
+
+	if q.Len() > 0 {
+		buffer := q.buffer
+		tmp := buffer.Peek()
+		buffer.Remove()
+		atomic.AddInt32(&q.count, -1)
+		*v <- tmp
 	} else {
-		n := copy(newBuf, q.buf[q.head:])
-		copy(newBuf[n:], q.buf[:q.tail])
+		*v <- nil
 	}
-
-	q.head = 0
-	q.tail = q.count
-	q.buf = newBuf
+	return
 }
 
-func (q *Queue) notify() {
-	if len(q.items) > 0 {
-		select {
-		case q.NotEmpty <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// Adds one element at the back of the queue
-func (q *Queue) Push(elem interface{}) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	if q.count == len(q.buf) {
-		q.resize()
-	}
-
-	id := q.newId()
-	q.items[id] = elem
-	q.ids[elem] = id
-	q.buf[q.tail] = id
-	// bitwise modulus
-	q.tail = (q.tail + 1) & (len(q.buf) - 1)
-	q.count++
-
-	q.notify()
-
-	if q.count == 1 {
-		q.notEmpty.Broadcast()
+// Push 插入队列，非阻塞
+func (q *Queue) Push(v interface{}) {
+	q.Mutex.Lock()
+	defer q.Mutex.Unlock()
+	if !q.closed {
+		q.buffer.Add(v)
+		atomic.AddInt32(&q.count, 1)
+		q.popable.Signal()
 	}
 }
 
-func (q *Queue) newId() int64 {
+// Len 获取队列长度
+func (q *Queue) Len() int {
+	return (int)(atomic.LoadInt32(&q.count))
+}
+
+// Close MyQueue
+// After close, Pop will return nil without block, and TryPop will return v=nil, ok=True
+func (q *Queue) Close() {
+	q.Mutex.Lock()
+	defer q.Mutex.Unlock()
+	if !q.closed {
+		q.closed = true
+		atomic.StoreInt32(&q.count, 0)
+		q.popable.Broadcast() //广播
+	}
+}
+
+// IsClose check is closed
+func (q *Queue) IsClose() bool {
+	return q.closed
+}
+
+//Wait 等待队列消费完成
+func (q *Queue) Wait() {
 	for {
-		id := rand.Int63()
-		_, ok := q.items[id]
-		if id != 0 && !ok {
-			return id
-		}
-	}
-}
-
-// Adds one element at the front of queue
-func (q *Queue) Prepend(elem interface{}) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	if q.count == len(q.buf) {
-		q.resize()
-	}
-
-	q.head = (q.head - 1) & (len(q.buf) - 1)
-	id := q.newId()
-	q.items[id] = elem
-	q.ids[elem] = id
-	q.buf[q.head] = id
-	// bitwise modulus
-	q.count++
-
-	q.notify()
-
-	if q.count == 1 {
-		q.notEmpty.Broadcast()
-	}
-}
-
-// Previews element at the front of queue
-func (q *Queue) Front() interface{} {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	id := q.buf[q.head]
-	if id != 0 {
-		return q.items[id]
-	}
-	return nil
-}
-
-// Previews element at the back of queue
-func (q *Queue) Back() interface{} {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-	id := q.buf[(q.tail-1)&(len(q.buf)-1)]
-	if id != 0 {
-		return q.items[id]
-	}
-	return nil
-}
-
-func (q *Queue) pop() int64 {
-	for {
-		if q.count <= 0 {
-			q.notEmpty.Wait()
-		}
-
-		// I have no idea why, but sometimes it's less than 0
-		if q.count > 0 {
+		if q.closed || q.Len() == 0 {
 			break
 		}
+
+		runtime.Gosched() //出让时间片
 	}
-
-	id := q.buf[q.head]
-	q.buf[q.head] = 0
-
-	// bitwise modulus
-	q.head = (q.head + 1) & (len(q.buf) - 1)
-	q.count--
-	if len(q.buf) > minQueueLen && (q.count<<1) == len(q.buf) {
-		q.resize()
-	}
-
-	return id
-}
-
-// Pop removes and returns the element from the front of the queue.
-// If the queue is empty, it will block
-func (q *Queue) Pop() interface{} {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	for {
-		id := q.pop()
-
-		item, ok := q.items[id]
-
-		if ok {
-			delete(q.ids, item)
-			delete(q.items, id)
-			q.notify()
-			return item
-		}
-	}
-}
-
-// Removes one element from the queue
-func (q *Queue) Remove(elem interface{}) bool {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	id, ok := q.ids[elem]
-	if !ok {
-		return false
-	}
-	delete(q.ids, elem)
-	delete(q.items, id)
-	return true
 }
