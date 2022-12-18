@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"gopkg.in/eapache/queue.v1"
 	"runtime"
 	"sync"
 	"sync/atomic"
